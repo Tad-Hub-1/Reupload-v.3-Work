@@ -1,0 +1,27 @@
+--!strict
+local AssetIdFilter = {}
+
+-- [[ PATH EDITED ]]
+-- เรียก "พี่น้อง" ที่อยู่ใน "หัวใจ" (PluginScript) เดียวกัน
+local getAssetIds = require(script.Parent.GetAssetIds)
+local changeIds = require(script.Parent.ChangeIds)
+
+export type FilterOptions = getAssetIds.FilterOptions
+
+function AssetIdFilter.filterInstances(filterOptions: getAssetIds.FilterOptions): { [number]: { Instance } }
+    return getAssetIds(filterOptions)
+end
+
+function AssetIdFilter.getIdArray(filteredIds: { [number]: { Instance } } ): { number }
+    local idArray = {}
+    for id, _ in filteredIds do
+        table.insert(idArray, id)
+    end
+    return idArray
+end
+
+function AssetIdFilter.replaceIds(filteredIds: { [number]: { Instance } }, idsToChange: { changeIds.IdPair })
+    changeIds(filteredIds, idsToChange)
+end
+
+return AssetIdFilter
