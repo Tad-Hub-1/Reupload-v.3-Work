@@ -1,6 +1,8 @@
 -- PluginScript.server.luau
--- นี่คือ "หัวใจ" หลักของ Plugin
--- (เวอร์ชัน Server: มี UI, Tabs, Port Input, และ Logic การสื่อสาร)
+-- [[  V3 - อัปเกรด  ]]
+-- 1. เพิ่มปุ่ม Toggle "Check Existing"
+-- 2. ส่งค่า "check_existing" (true/false) ไปให้ Python Server
+-- 3. [แก้ไข] เปลี่ยน URL endpoint เป็น "/api/reupload_single" (ตาม Python script ใหม่)
 
 -- 1. Services
 local HttpService
@@ -22,11 +24,12 @@ if not AssetIdFilter then
 end
 
 -- 3. ตัวแปรสถานะ
-local currentTab = "Animation" -- "Animation" หรือ "Sound"
+local currentTab = "Animation"
 local isProcessing = false
+local checkExisting = false -- <--- [ใหม่] สถานะของปุ่ม Toggle (ค่าเริ่มต้นคือ "ปิด")
 
 -- 4. สร้างปุ่ม Toolbar
-local toolbar = plugin:CreateToolbar("Asset Reuploader")
+local toolbar = plugin:CreateToolbar("Asset Reuploader V3")
 local mainButton = toolbar:CreateButton(
     "Open Re-uploader",
     "Open the asset re-uploader panel",
@@ -35,18 +38,18 @@ local mainButton = toolbar:CreateButton(
 
 -- 5. สร้าง GUI (หน้าต่างหลัก)
 local widget = plugin:CreateDockWidgetPluginGui(
-    "AssetReuploader",
+    "AssetReuploaderV3",
     DockWidgetPluginGuiInfo.new(
         Enum.InitialDockState.Float,
         true, -- Enabled
         false, -- OverridePoV
         280,   -- Width
-        400,   -- Height
+        450,   -- Height (เพิ่มความสูง)
         280,   -- MinWidth
-        300    -- MinHeight
+        400    -- MinHeight
     )
 )
-widget.Title = "Live Re-uploader"
+widget.Title = "Live Re-uploader V3"
 
 -- 6. สร้างองค์ประกอบ GUI
 -- [[ Main Frame ]]
@@ -136,6 +139,30 @@ soundButton.TextColor3 = Color3.fromRGB(150, 150, 150) -- สี Inactive
 soundButton.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
 soundButton.Parent = tabFrame
 
+-- [[  ปุ่ม Toggle (ใหม่)  ]]
+local checkExistingToggle = Instance.new("TextButton")
+checkExistingToggle.Name = "CheckExistingToggle"
+checkExistingToggle.Size = UDim2.new(1, 0, 0, 30)
+checkExistingToggle.BackgroundColor3 = Color3.fromRGB(180, 50, 50) -- สีแดง (OFF)
+checkExistingToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
+checkExistingToggle.Font = Enum.Font.SourceSansBold
+checkExistingToggle.TextSize = 14
+checkExistingToggle.Text = "Check Existing: OFF (Re-upload เลย)"
+checkExistingToggle.LayoutOrder = 5
+checkExistingToggle.Parent = mainFrame
+
+local toggleHint = Instance.new("TextLabel")
+toggleHint.Size = UDim2.new(1, 0, 0, 15)
+toggleHint.Text = "(ใช้ได้เฉพาะเมื่อรัน Python ด้วย Cookie)"
+toggleHint.Font = Enum.Font.SourceSansItalic
+toggleHint.TextSize = 12
+toggleHint.TextColor3 = Color3.fromRGB(150, 150, 150)
+toggleHint.TextXAlignment = Enum.TextXAlignment.Left
+toggleHint.BackgroundTransparency = 1
+toggleHint.LayoutOrder = 6
+toggleHint.Parent = mainFrame
+
+
 -- [[ Start Button ]]
 local startButton = Instance.new("TextButton")
 startButton.Name = "StartButton"
@@ -145,13 +172,13 @@ startButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 startButton.Font = Enum.Font.SourceSansBold
 startButton.TextSize = 18
 startButton.Text = "Start Re-upload (Animation)"
-startButton.LayoutOrder = 5
+startButton.LayoutOrder = 7
 startButton.Parent = mainFrame
 
 -- [[ Status Label ]]
 local statusLabel = Instance.new("TextLabel")
 statusLabel.Name = "StatusLabel"
-statusLabel.Size = UDim2.new(1, 0, 1, -150) -- ขนาดที่ยืดหยุ่น
+statusLabel.Size = UDim2.new(1, 0, 1, -200) -- ปรับขนาดตาม UI ใหม่
 statusLabel.Text = "Ready. (Run Python server first)"
 statusLabel.Font = Enum.Font.SourceSans
 statusLabel.TextSize = 14
@@ -160,7 +187,7 @@ statusLabel.BackgroundTransparency = 1
 statusLabel.TextWrapped = true
 statusLabel.TextYAlignment = Enum.TextYAlignment.Top
 statusLabel.TextXAlignment = Enum.TextXAlignment.Left
-statusLabel.LayoutOrder = 6
+statusLabel.LayoutOrder = 8
 statusLabel.Parent = mainFrame
 
 -- 7. Logic การทำงาน
@@ -191,6 +218,22 @@ soundButton.MouseButton1Click:Connect(function()
     updateTab("Sound")
 end)
 
+-- [[  Logic ปุ่ม Toggle (ใหม่)  ]]
+checkExistingToggle.MouseButton1Click:Connect(function()
+    if isProcessing then return end
+    
+    checkExisting = not checkExisting -- สลับค่า
+    
+    if checkExisting then
+        checkExistingToggle.Text = "Check Existing: ON (ค้นหาก่อน)"
+        checkExistingToggle.BackgroundColor3 = Color3.fromRGB(50, 180, 50) -- สีเขียว
+    else
+        checkExistingToggle.Text = "Check Existing: OFF (Re-upload เลย)"
+        checkExistingToggle.BackgroundColor3 = Color3.fromRGB(180, 50, 50) -- สีแดง
+    end
+end)
+
+
 -- [[ ฟังก์ชันหลัก: เมื่อกดปุ่ม Start ]]
 startButton.MouseButton1Click:Connect(function()
     if isProcessing then return end
@@ -199,7 +242,6 @@ startButton.MouseButton1Click:Connect(function()
     startButton.BackgroundColor3 = Color3.fromRGB(180, 100, 0)
     statusLabel.Text = "Starting..."
 
-    -- ทำงานใน Coroutine เพื่อไม่ให้ Studio ค้าง
     task.spawn(function()
         local port = portInput.Text
         if not port or not port:match("%d+") then
@@ -209,15 +251,16 @@ startButton.MouseButton1Click:Connect(function()
         end
         
         local baseUrl = "http://localhost:" .. port
-        local assetType = currentTab -- "Animation" or "Sound"
+        local assetType = currentTab
+        local checkExistingState = checkExisting -- <--- [ใหม่] อ่านค่า Toggle 1 ครั้งก่อนเริ่ม
         
-        -- 1. ตั้งค่าการค้นหา (ตาม Tab ที่เลือก)
+        -- 1. ตั้งค่าการค้นหา
         local filterOptions: AssetIdFilter.FilterOptions = {
             Instances = {game},
             WhitelistedInstances = {
                 (assetType == "Animation" and "Animation" or "Sound"),
-                "LuaSourceContainer", -- ค้นหาใน Script ด้วยเสมอ
-                "StringValue", "NumberValue", "IntValue" -- ค้นหาใน Value ด้วย
+                "LuaSourceContainer", 
+                "StringValue", "NumberValue", "IntValue" 
             }
         }
         
@@ -229,13 +272,13 @@ startButton.MouseButton1Click:Connect(function()
         -- แปลงผลลัพธ์เป็น List ที่จะส่งไป Python
         local assetsToProcess = {}
         for oldId, instances in pairs(filteredInstances) do
-            -- ใช้ชื่อของ Instance แรกที่เจอเป็นชื่อ Asset ใหม่
             local firstInstance = instances[1]
             if firstInstance then
                 table.insert(assetsToProcess, {
                     oldId = oldId,
                     name = string.format("%s_%s", assetType, firstInstance.Name),
-                    type = assetType
+                    type = assetType,
+                    check_existing = checkExistingState -- <--- [ใหม่] ส่งสถานะ Toggle ไปด้วย
                 })
             end
         end
@@ -263,37 +306,52 @@ startButton.MouseButton1Click:Connect(function()
                 
             local requestBody = HttpService:JSONEncode(assetData)
             
-            -- ส่ง Request ไปหา Python Server
+            -- [[  แก้ไข Endpoint  ]]
+            -- ส่ง Request ไปหา Python Server (Endpoint ใหม่: /api/reupload_single)
             local success, response = pcall(function()
-                return HttpService:PostAsync(baseUrl .. "/reupload", requestBody, Enum.HttpContentType.ApplicationJson)
+                return HttpService:PostAsync(baseUrl .. "/api/reupload_single", requestBody, Enum.HttpContentType.ApplicationJson)
             end)
             
             if not success then
                 statusLabel.Text = string.format("[%d/%d] FAILED: %s. Is Python server running on port %s?", i, #assetsToProcess, assetName, port)
                 warn("PostAsync Error:", response)
                 failCount += 1
-                continue -- ข้ามไปอันถัดไป
+                continue 
             end
             
             -- 4. รับผลลัพธ์จาก Python
-            local responseData = HttpService:JSONDecode(response)
+            local responseData
+            local decodeSuccess, decodeResult = pcall(function()
+                responseData = HttpService:JSONDecode(response)
+            end)
+
+            if not decodeSuccess then
+                 statusLabel.Text = string.format("[%d/%d] FAILED: %s (Could not decode server response)", i, #assetsToProcess, assetName)
+                 warn("JSONDecode Error:", decodeResult)
+                 failCount += 1
+                 continue
+            end
             
-            if responseData.status == "success" then
+            if responseData.status == "ok" then
                 local newId = responseData.newId
                 
-                statusLabel.Text = string.format("[%d/%d] SUCCESS: %s. Replacing %d -> %d",
-                    i, #assetsToProcess, assetName, oldId, newId)
+                if responseData.skipped then
+                    statusLabel.Text = string.format("[%d/%d] SKIPPED: %s. Using existing ID: %d",
+                        i, #assetsToProcess, assetName, newId)
+                else
+                    statusLabel.Text = string.format("[%d/%d] SUCCESS: %s. Replacing %d -> %d",
+                        i, #assetsToProcess, assetName, oldId, newId)
+                end
                 
                 -- 5. เรียก "สมอง" ให้แทนที่ ID
-                -- (เราส่ง ID ที่จะเปลี่ยนแค่คู่เดียว)
                 local idPairList = {{ oldId = oldId, newId = newId }}
                 AssetIdFilter.replaceIds(filteredInstances, idPairList)
                 
                 successCount += 1
             else
                 statusLabel.Text = string.format("[%d/%d] FAILED: %s (Server Error: %s)",
-                    i, #assetsToProcess, assetName, responseData.message or "Unknown")
-                warn("Server Error:", responseData.message)
+                    i, #assetsToProcess, assetName, responseData.error or "Unknown")
+                warn("Server Error:", responseData.error)
                 failCount += 1
             end
             
