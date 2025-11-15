@@ -1,229 +1,369 @@
 #!/usr/bin/env python3
 """
-reupload_server.py
-A local HTTP server that listens for requests from a Roblox plugin,
-downloads the old asset, re-uploads it, and sends back the new ID.
+reupload_server_v3.py
+Combines the Flask server from the user's example with our robust
+sequential processing. Includes auth verification, colorama, and 
+the (cookie-only) "find existing asset" feature.
 """
 
 import os
 import sys
 import json
+import random
 import time
 import mimetypes
-import socketserver
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Optional
+
+# --- Imports (ต้องติดตั้ง) ---
+try:
+    from flask import Flask, request, jsonify
+except Exception:
+    print("Flask is required. Install: pip install flask requests colorama")
+    sys.exit(1)
 
 try:
     import requests
 except Exception:
-    print("Please install requests: pip install requests")
+    print("Requests required. Install: pip install flask requests colorama")
     sys.exit(1)
 
-# ----------------- Global Config (will be set at start) -----------------
-cfg = {
-    "x_api_key": None,
+try:
+    import colorama
+    from colorama import Fore, Style
+    colorama.init(autoreset=True) # <-- ทำให้สีกลับมาเป็นปกติอัตโนมัติ
+except Exception:
+    print("Colorama is recommended for colored output: pip install colorama")
+    class DummyFore: __getattr__ = lambda self, name: ""
+    Fore = DummyFore()
+# --- จบ Imports ---
+
+
+# --- Config Setup ---
+BASE_DIR = Path(__file__).parent if '__file__' in locals() else Path.cwd()
+CFG_PATH = BASE_DIR / "reupload_server_config.json"
+
+DEFAULT_CFG = {
+    "auth_method": None,
     "roblosecurity": None,
+    "x_api_key": None,
+    "port": None,
+    "user_id": None, # <--- [ใหม่] เก็บ UserID ถ้าใช้ Cookie
     "download_endpoint": "https://apis.roblox.com/asset-delivery-api/v1/assetId/{assetId}",
+    "download_fallback": "https://assetdelivery.roblox.com/v1/asset/?id={assetId}",
     "upload_endpoint": "https://apis.roblox.com/assets/v1/assets"
 }
 
-# ----------------- Helpers -----------------
+# โหลด config หรือสร้างใหม่
+if CFG_PATH.exists():
+    try:
+        cfg = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+        if "user_id" not in cfg: cfg["user_id"] = None
+    except Exception:
+        cfg = DEFAULT_CFG.copy()
+else:
+    cfg = DEFAULT_CFG.copy()
+
+# --- Auth & API Helpers ---
+
 def build_headers():
-    headers = { "User-Agent": "AssetReuploaderServer/1.0" }
-    if cfg["x_api_key"]:
+    """ สร้าง Headers สำหรับ API call """
+    headers = {"User-Agent": "AssetReuploaderServer/V3"}
+    if cfg.get("auth_method") == "x_api_key" and cfg.get("x_api_key"):
         headers["x-api-key"] = cfg["x_api_key"]
-    if cfg["roblosecurity"]:
+    if cfg.get("auth_method") == "roblosecurity" and cfg.get("roblosecurity"):
         headers["Cookie"] = f".ROBLOSECURITY={cfg['roblosecurity']}"
     return headers
 
-def guess_mime_from_name(name: str):
-    t, _ = mimetypes.guess_type(name)
+def verify_auth():
+    """ [ใหม่] ตรวจสอบว่า Key/Cookie ใช้งานได้จริง """
+    headers = build_headers()
+    print("[INFO] Checking authentication validity...")
+
+    try:  
+        if cfg["auth_method"] == "roblosecurity":  
+            # ตรวจสอบ Cookie โดยการดึงข้อมูลผู้ใช้
+            r = requests.get("https://users.roblox.com/v1/users/authenticated", headers=headers, timeout=10)  
+            if r.status_code == 200:
+                user_json = r.json()
+                user = user_json.get("name", "?")
+                user_id = user_json.get("id")
+                if not user_id:
+                    print(Fore.RED + f"[ERR] .ROBLOSECURITY valid, but could not retrieve user ID.")
+                    return False
+                cfg['user_id'] = user_id # <--- เก็บ UserID ไว้ใช้ค้นหา
+                print(Fore.GREEN + f"[OK] .ROBLOSECURITY valid (Logged in as {user}, ID: {user_id})")  
+                return True  
+            else:  
+                print(Fore.RED + f"[ERR] Invalid .ROBLOSECURITY cookie (HTTP {r.status_code})")  
+                return False  
+        elif cfg["auth_method"] == "x_api_key":  
+            # ตรวจสอบ API Key โดยการพยายาม List Universes
+            cfg['user_id'] = None # API Key ไม่สามารถใช้ UserID ได้
+            r = requests.get("https://apis.roblox.com/cloud/v2/universes", headers=headers, timeout=10)  
+            if r.status_code == 200: # 200 = OK
+                print(Fore.GREEN + f"[OK] x-api-key appears valid (HTTP {r.status_code})")  
+                return True
+            elif r.status_code == 401: # 401 = Unauthorized
+                print(Fore.RED + f"[ERR] Invalid x-api-key (HTTP {r.status_code})")  
+                return False
+            else: # 403, 404, ฯลฯ แปลว่า Key ถูก แต่แค่ไม่มีสิทธิ์ (ซึ่ง OK)
+                print(Fore.GREEN + f"[OK] x-api-key is valid, but may lack permissions (HTTP {r.status_code})")
+                return True
+        else:  
+            print(Fore.RED + "[ERR] Unknown auth method.")  
+            return False  
+    except Exception as e:  
+        print(Fore.RED + f"[ERR] Auth check failed: {e}")  
+        return False
+
+def cli_setup():
+    """ [ใหม่] หน้าจอ Setup ที่ถาม 1 หรือ 2 """
+    print("--- Roblox Asset Re-uploader Server V3 ---")
+    
+    # ถ้าใน config มี key/cookie อยู่แล้ว ถามว่าจะใช้ซ้ำไหม
+    if (cfg.get("roblosecurity") or cfg.get("x_api_key")) and cfg.get("port"):
+        print(f"[INFO] Found saved config for method: {cfg.get('auth_method')}")
+        use_saved = input("Use saved credentials? (Y/n): ").strip().lower()
+        if use_saved in ('y', 'yes', ''):
+            if verify_auth():
+                return # ใช้ของเก่าได้เลย
+            else:
+                print("[WARN] Saved credentials failed verification. Please re-enter.")
+
+    print("Select Authentication Method:")
+    print("  1: .ROBLOSECURITY Cookie (Can check for existing assets)")
+    print("  2: OpenCloud x-api-key (Cannot check for existing assets)")
+    
+    choice = ""
+    while choice not in ("1", "2"):
+        choice = input("Choice (1/2): ").strip()
+        
+    if choice == "1":  
+        cfg["auth_method"] = "roblosecurity"  
+        cfg["x_api_key"] = None
+        cfg["roblosecurity"] = input("Paste your .ROBLOSECURITY Cookie: ").strip()  
+    else:  
+        cfg["auth_method"] = "x_api_key"  
+        cfg["roblosecurity"] = None
+        cfg["user_id"] = None
+        cfg["x_api_key"] = input("Paste your x-api-key (OpenCloud): ").strip()  
+    
+    suggested = random.randint(27000, 40000)  
+    p = input(f"Enter port to run server on (or press Enter to use {suggested}): ").strip()  
+    try:  
+        cfg["port"] = int(p) if p else suggested  
+    except:  
+        cfg["port"] = suggested  
+        
+    print("\n[STEP] Verifying credentials...")  
+    if not verify_auth():  
+        print(Fore.RED + "[FATAL] Authentication failed. Please check your credentials.")  
+        sys.exit(1)  
+        
+    CFG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")  
+    print(Fore.GREEN + f"[OK] Auth verified successfully.")  
+    print(f"[INFO] Config saved to {CFG_PATH} for next time.")  
+    print(f"[INFO] Server will listen on http://localhost:{cfg['port']}\n")
+
+def guess_mime(filename):
+    t,_ = mimetypes.guess_type(filename)
     return t or "application/octet-stream"
 
-# ----------------- Download/Upload -----------------
+# --- Main Re-upload Logic ---
+
+def print_success_location(newId):
+    """ [ใหม่] พิมพ์ Link สีเขียว หลังอัปโหลดเสร็จ """
+    dashboard_url = ""
+    if cfg.get("auth_method") == "roblosecurity":
+        # ถ้าใช้ Cookie, มันจะไปที่ "My Creations"
+        dashboard_url = f"https://create.roblox.com/dashboard/creations/configure?id={newId}"
+    else:
+        # ถ้าใช้ API Key, มันจะไปที่ "Group Creations" หรือหน้า Asset
+        dashboard_url = f"https://www.roblox.com/library/{newId}/"
+    
+    print(Fore.GREEN + f"    -> Asset is ready. Configure it at: {dashboard_url}")
+
+
+def find_existing_asset(displayName, assetType):
+    """ [ใหม่] ค้นหา Asset ที่มีอยู่ (เฉพาะ Cookie) """
+    if cfg.get("auth_method") != "roblosecurity" or not cfg.get("user_id"):
+        return False, None # ทำงานเฉพาะเมื่อใช้ Cookie และมี UserID
+        
+    userId = cfg["user_id"]
+    headers = build_headers()
+    cursor = ""
+    url_template = f"https://economy.roblox.com/v2/users/{userId}/assets/creations?assetTypes={assetType}&limit=100"
+    
+    print(f"    [?] Checking inventory for '{displayName}'...")
+    
+    while True: 
+        url = url_template
+        if cursor:
+            url += f"&cursor={cursor}"
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code != 200:
+                print(Fore.YELLOW + f"    [WARN] Inventory check failed (HTTP {r.status_code}). Skipping check.")
+                return False, None
+            data = r.json()
+            if not data.get("data"):
+                return False, None 
+            
+            for item in data["data"]:
+                if item.get("name") == displayName:
+                    asset_id = item.get("assetId")
+                    if asset_id:
+                        print(Fore.CYAN + f"    [OK] Found matching asset: {displayName} -> {asset_id}")
+                        return True, asset_id
+                        
+            cursor = data.get("nextPageCursor")
+            if not cursor:
+                break # ไม่เจอ และไม่มีหน้าถัดไป
+        except Exception as e:
+            print(Fore.YELLOW + f"    [WARN] Inventory check error: {e}. Skipping check.")
+            return False, None
+    return False, None # ไม่เจอ
+
 def download_asset(asset_id):
+    """ ดาวน์โหลด Asset (เหมือนเดิม) """
     url = cfg["download_endpoint"].format(assetId=asset_id)
     headers = build_headers()
     try:
-        r = requests.get(url, headers=headers, timeout=15, allow_redirects=True, stream=True)
+        r = requests.get(url, headers=headers, timeout=15)
     except Exception as e:
-        return False, f"Request error: {e}"
-    if r.status_code >= 400:
-        return False, f"Download failed {r.status_code}: {r.text[:400]}"
+        return False, f"Download error: {e}"
     
-    filename = f"asset_{asset_id}.bin"
-    try:
-        content = r.content
-    except Exception as e:
-        return False, f"Failed read content: {e}"
-    return True, {"bytes": content, "filename": filename}
+    if r.status_code >= 400:
+        # ถ้าล้มเหลว, ลอง Fallback URL
+        fb = cfg["download_fallback"].format(assetId=asset_id)
+        try:
+            r2 = requests.get(fb, headers=headers, timeout=10)
+            if r2.status_code >= 400:
+                return False, f"Download failed {r.status_code} + fallback {r2.status_code}"
+            r = r2
+        except Exception as e:
+            return False, f"Primary download failed {r.status_code}, fallback error: {e}"
+            
+    return True, {"bytes": r.content, "filename": f"asset_{asset_id}.bin"}
 
-def upload_asset(file_bytes, filename, display_name, description, asset_type):
+def upload_asset(file_bytes, filename, displayName, assetType):
+    """ อัปโหลด Asset (เหมือนเดิม) """
     url = cfg["upload_endpoint"]
     headers = build_headers()
     request_payload = {
-        "assetType": asset_type or "Model",
-        "displayName": display_name,
-        "description": description,
+        "assetType": assetType,
+        "displayName": displayName,
+        "description": f"Re-uploaded via Plugin at {time.ctime()}",
         "creationContext": {}
     }
     files = {
         "request": (None, json.dumps(request_payload), "application/json"),
-        "fileContent": (filename, file_bytes, guess_mime_from_name(filename))
+        "fileContent": (filename, file_bytes, guess_mime(filename))
     }
     try:
         r = requests.post(url, headers=headers, files=files, timeout=30)
     except Exception as e:
         return False, f"Upload request failed: {e}"
+        
     if r.status_code >= 400:
-        return False, f"Upload failed {r.status_code}: {r.text[:1000]}"
-    try:
-        return True, r.json()
-    except Exception:
-        return False, f"Upload returned non-json: {r.text[:1000]}"
+        return False, f"Upload failed {r.status_code}: {r.text[:300]}"
+    return True, r.json()
 
-# ----------------- HTTP Server Handler -----------------
-class PluginRequestHandler(BaseHTTPRequestHandler):
+
+def process_single(item):
+    """
+    [อัปเกรด] Process Asset 1 ชิ้น
+    นี่คือ Logic หลักที่ Server ทำงาน
+    """
+    oldId = item.get("oldId")
+    name = item.get("name", f"item_{oldId}")
+    assetType = item.get("type", "Animation")
+    check_existing = item.get("check_existing", False) # <--- [ใหม่] รับค่าจาก Plugin
     
-    def _send_cors_headers(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self._send_cors_headers()
-        self.end_headers()
-
-    def do_POST(self):
-        if self.path == '/reupload':
-            try:
-                content_length = int(self.headers['Content-Length'])
-                body = self.rfile.read(content_length)
-                data = json.loads(body)
-                
-                old_id = data.get('oldId')
-                asset_name = data.get('name')
-                asset_type = data.get('type')
-
-                if not old_id or not asset_name or not asset_type:
-                    self._send_response(400, {"status": "error", "message": "Missing oldId, name, or type"})
-                    return
-
-                print(f"[+] RX: Request to process {asset_type} ID: {old_id} (Name: {asset_name})")
-
-                print(f"  [1/3] Downloading asset {old_id}...")
-                dl_ok, dl_data = download_asset(old_id)
-                if not dl_ok:
-                    print(f"  [!] Download failed: {dl_data}")
-                    self._send_response(500, {"status": "error", "message": f"Download failed: {dl_data}"})
-                    return
-
-                print(f"  [2/3] Uploading new asset as '{asset_name}'...")
-                up_ok, up_res = upload_asset(
-                    dl_data["bytes"], 
-                    dl_data["filename"], 
-                    display_name=asset_name, 
-                    description="Re-uploaded via Plugin", 
-                    asset_type=asset_type
-                )
-                
-                if not up_ok:
-                    print(f"  [!] Upload failed: {up_res}")
-                    self._send_response(500, {"status": "error", "message": f"Upload failed: {up_res}"})
-                    return
-
-                new_id = None
-                if isinstance(up_res, dict):
-                    new_id = up_res.get("assetId") or up_res.get("id") or up_res.get("data", {}).get("assetId")
-
-                if not new_id:
-                    print(f"  [!] Upload OK, but no new ID found in response: {up_res}")
-                    self._send_response(500, {"status": "error", "message": "Upload OK, but no new ID found"})
-                    return
-                
-                print(f"  [3/3] Success! {old_id}  --->  {new_id}")
-                
-                self._send_response(200, {
-                    "status": "success",
-                    "oldId": old_id,
-                    "newId": new_id
-                })
-
-            except Exception as e:
-                print(f"[!] Server Error: {e}")
-                self._send_response(500, {"status": "error", "message": str(e)})
-        else:
-            self._send_response(404, {"status": "error", "message": "Not Found"})
-
-    def _send_response(self, http_code, payload_dict):
-        try:
-            self.send_response(http_code)
-            self._send_cors_headers()
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(payload_dict).encode('utf-8'))
-        except Exception as e:
-            print(f"Error sending response: {e}")
-
-    def log_message(self, format, *args):
-        pass
-
-# ----------------- Main -----------------
-def find_free_port(start_port=27000):
-    for port in range(start_port, 65535):
-        with socketserver.socket.socket(socketserver.AF_INET, socketserver.SOCK_STREAM) as s:
-            try:
-                s.bind(('', port))
-                return port
-            except OSError:
-                continue
-    raise IOError("No free ports found")
-
-def main():
-    print("--- Roblox Asset Re-uploader Server ---")
-    print("Select Authentication Method:")
-    print("  1: .ROBLOSECURITY Cookie (Simple, less secure)")
-    print("  2: OpenCloud x-api-key (Recommended, more secure)")
+    print(Fore.CYAN + f"[+] RX: Request to process {assetType} ID: {oldId} (Name: {name})")
     
-    auth_choice = ""
-    while auth_choice not in ('1', '2'):
-        auth_choice = input("Select (1 or 2): ").strip()
-        
-    if auth_choice == '1':
-        cfg["roblosecurity"] = input("Paste your .ROBLOSECURITY Cookie: ").strip()
+    # --- [ใหม่] ตรวจสอบของเก่า ---
+    if check_existing:
+        found, existing_id = find_existing_asset(name, assetType)
+        if found:
+            print(Fore.CYAN + f"    [SKIP] Using existing asset {existing_id} for '{name}'.")
+            print_success_location(existing_id)
+            return {"oldId": oldId, "newId": existing_id, "status": "ok", "skipped": True}
     else:
-        cfg["x_api_key"] = input("Paste your x-api-key: ").strip()
-        
-    if not cfg["roblosecurity"] and not cfg["x_api_key"]:
-        print("No credentials provided, exiting.")
-        sys.exit(1)
+        print("    [INFO] 'Check Existing' is OFF. Proceeding to re-upload.")
+    # --- จบส่วนตรวจสอบ ---
 
-    try:
-        port = find_free_port()
-        server_address = ('localhost', port)
+    print(f"    [1/3] Downloading original asset {oldId}...")
+    ok, data = download_asset(oldId)
+    if not ok:
+        print(Fore.RED + f"    [ERR] Download failed for {oldId}: {data}")
+        return {"oldId": oldId, "status": "download_failed", "error": data, "name": name}
         
-        with socketserver.TCPServer(server_address, PluginRequestHandler) as httpd:
-            httpd.allow_reuse_address = True
-            print("\n" + "="*40)
-            print(f"✅ Server is running!")
-            print(f"📡 Your plugin can connect at:")
-            print(f"      http://localhost:{port}")
-            print("\n👉 Please copy this Port Number into your Roblox Plugin:")
-            print(f"      {port}")
-            print("="*40)
-            print("\n(Server is running. Press Ctrl+C to stop)")
-            
-            httpd.serve_forever()
-            
-    except KeyboardInterrupt:
-        print("\n[INFO] Stopping server...")
-    except Exception as e:
-        print(f"[ERROR] Failed to start server: {e}")
-        print("Another program might be using this port, or Antivirus is blocking it.")
-        input("Press Enter to exit...")
+    print(f"    [2/3] Uploading new asset as '{name}'...")
+    ok2, res = upload_asset(data["bytes"], data["filename"], name, assetType)
+    
+    if not ok2:
+        print(Fore.RED + f"    [ERR] Upload failed for {oldId}: {res}")
+        return {"oldId": oldId, "status": "upload_failed", "error": res, "name": name}
+    
+    newId = res.get("assetId")
+    if not newId:
+        print(Fore.RED + f"    [ERR] Upload succeeded but no assetId found for {oldId}.")
+        return {"oldId": oldId, "status": "upload_failed", "error": "No assetId in response", "name": name}
 
+    print(Fore.GREEN + f"    [3/3] Re-upload success: {oldId}  --->  {newId}")
+    print_success_location(newId) # <--- [ใหม่] พิมพ์ Link สีเขียว
+    return {"oldId": oldId, "newId": newId, "status": "ok", "name": name}
+
+# --- Flask Server ---
+app = Flask("asset_reupload_server_v3")
+
+@app.route("/api/reupload_single", methods=["POST", "OPTIONS"])
+def api_reupload_single():
+    """ นี่คือ Endpoint ที่ Plugin จะเรียก """
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+        
+    payload = request.get_json(force=True, silent=True)
+    if not payload or "oldId" not in payload:
+        return _corsify_actual_response(jsonify({"error": "Invalid payload, missing oldId"}), 400)
+    
+    # เรียก Logic หลัก
+    result = process_single(payload)
+    
+    return _corsify_actual_response(jsonify(result))
+
+@app.route("/api/ping", methods=["GET", "OPTIONS"])
+def ping():
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    return _corsify_actual_response(jsonify({"pong": True, "auth_method": cfg.get("auth_method")}))
+
+# --- [ใหม่] Flask CORS Helpers ---
+# (จำเป็นสำหรับ Flask Server)
+def _build_cors_preflight_response():
+    response = jsonify({"status": "ok"})
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add('Access-Control-Allow-Headers', "*")
+    response.headers.add('Access-Control-Allow-Methods', "*")
+    return response
+
+def _corsify_actual_response(response, status_code=200):
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    return response, status_code
+
+# --- Main ---
 if __name__ == "__main__":
-    main()
+    cli_setup() # <--- [ใหม่] รัน Setup ก่อน
+    port = int(cfg.get("port", 27000))
+    print("="*40)
+    print(Fore.GREEN + f"✅ Server is running!")
+    print(f"📡 Plugin can connect at: http://localhost:{port}")
+    print(Fore.YELLOW + f"👉 Port Number for Plugin: {port}")
+    print("="*40)
+    print("\n(Server is running. Press Ctrl+C to stop)")
+    try:
+        app.run(host="0.0.0.0", port=port, threaded=True)
+    except Exception as e:
+        print(Fore.RED + f"[FATAL] Failed to start Flask server: {e}")
+        input("Press Enter to exit...")
