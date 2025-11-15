@@ -21,7 +21,7 @@ except Exception:
     print("Please install requests: pip install requests")
     sys.exit(1)
 
-# ----------------- Global Config (จะถูกตั้งค่าตอนเริ่ม) -----------------
+# ----------------- Global Config (will be set at start) -----------------
 cfg = {
     "x_api_key": None,
     "roblosecurity": None,
@@ -29,10 +29,9 @@ cfg = {
     "upload_endpoint": "https://apis.roblox.com/assets/v1/assets"
 }
 
-# ----------------- Helpers (เหมือนเดิม) -----------------
+# ----------------- Helpers -----------------
 def build_headers():
     headers = { "User-Agent": "AssetReuploaderServer/1.0" }
-    # ใช้ Config ที่ตั้งไว้ตอนเริ่ม
     if cfg["x_api_key"]:
         headers["x-api-key"] = cfg["x_api_key"]
     if cfg["roblosecurity"]:
@@ -43,7 +42,7 @@ def guess_mime_from_name(name: str):
     t, _ = mimetypes.guess_type(name)
     return t or "application/octet-stream"
 
-# ----------------- Download/Upload (เหมือนเดิม) -----------------
+# ----------------- Download/Upload -----------------
 def download_asset(asset_id):
     url = cfg["download_endpoint"].format(assetId=asset_id)
     headers = build_headers()
@@ -54,7 +53,7 @@ def download_asset(asset_id):
     if r.status_code >= 400:
         return False, f"Download failed {r.status_code}: {r.text[:400]}"
     
-    filename = f"asset_{asset_id}.bin" # ชื่อไฟล์ไม่สำคัญมากสำหรับ server
+    filename = f"asset_{asset_id}.bin"
     try:
         content = r.content
     except Exception as e:
@@ -89,29 +88,25 @@ def upload_asset(file_bytes, filename, display_name, description, asset_type):
 class PluginRequestHandler(BaseHTTPRequestHandler):
     
     def _send_cors_headers(self):
-        """ ส่ง Headers เพื่อให้ Roblox Studio (localhost) คุยได้ """
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
 
     def do_OPTIONS(self):
-        """ ตอบกลับ OPTIONS (pre-flight) request """
-        self.send_response(204) # No Content
+        self.send_response(204)
         self._send_cors_headers()
         self.end_headers()
 
     def do_POST(self):
-        """ จัดการ Request ที่ Plugin ส่งมา """
         if self.path == '/reupload':
             try:
-                # 1. อ่านข้อมูล (Body) ที่ Plugin ส่งมา
                 content_length = int(self.headers['Content-Length'])
                 body = self.rfile.read(content_length)
                 data = json.loads(body)
                 
                 old_id = data.get('oldId')
                 asset_name = data.get('name')
-                asset_type = data.get('type') # 'Animation' หรือ 'Sound'
+                asset_type = data.get('type')
 
                 if not old_id or not asset_name or not asset_type:
                     self._send_response(400, {"status": "error", "message": "Missing oldId, name, or type"})
@@ -119,7 +114,6 @@ class PluginRequestHandler(BaseHTTPRequestHandler):
 
                 print(f"[+] RX: Request to process {asset_type} ID: {old_id} (Name: {asset_name})")
 
-                # 2. ดาวน์โหลด Asset เก่า
                 print(f"  [1/3] Downloading asset {old_id}...")
                 dl_ok, dl_data = download_asset(old_id)
                 if not dl_ok:
@@ -128,7 +122,6 @@ class PluginRequestHandler(BaseHTTPRequestHandler):
                     return
 
                 print(f"  [2/3] Uploading new asset as '{asset_name}'...")
-                # 3. อัปโหลด Asset ใหม่
                 up_ok, up_res = upload_asset(
                     dl_data["bytes"], 
                     dl_data["filename"], 
@@ -142,7 +135,6 @@ class PluginRequestHandler(BaseHTTPRequestHandler):
                     self._send_response(500, {"status": "error", "message": f"Upload failed: {up_res}"})
                     return
 
-                # 4. ค้นหา ID ใหม่ในผลลัพธ์
                 new_id = None
                 if isinstance(up_res, dict):
                     new_id = up_res.get("assetId") or up_res.get("id") or up_res.get("data", {}).get("assetId")
@@ -154,7 +146,6 @@ class PluginRequestHandler(BaseHTTPRequestHandler):
                 
                 print(f"  [3/3] Success! {old_id}  --->  {new_id}")
                 
-                # 5. ส่ง ID ใหม่กลับไปให้ Plugin
                 self._send_response(200, {
                     "status": "success",
                     "oldId": old_id,
@@ -168,7 +159,6 @@ class PluginRequestHandler(BaseHTTPRequestHandler):
             self._send_response(404, {"status": "error", "message": "Not Found"})
 
     def _send_response(self, http_code, payload_dict):
-        """ ส่ง JSON response กลับไปหา Plugin """
         try:
             self.send_response(http_code)
             self._send_cors_headers()
@@ -179,65 +169,61 @@ class PluginRequestHandler(BaseHTTPRequestHandler):
             print(f"Error sending response: {e}")
 
     def log_message(self, format, *args):
-        """ ปิด log ของ server ที่รกๆ (เช่น GET /... 200) """
         pass
 
 # ----------------- Main -----------------
 def find_free_port(start_port=27000):
-    """ หา Port ว่างๆ ตั้งแต่ 27000 ขึ้นไป """
     for port in range(start_port, 65535):
         with socketserver.socket.socket(socketserver.AF_INET, socketserver.SOCK_STREAM) as s:
             try:
                 s.bind(('', port))
                 return port
             except OSError:
-                continue # Port ไม่ว่าง
+                continue
     raise IOError("No free ports found")
 
 def main():
     print("--- Roblox Asset Re-uploader Server ---")
-    print("เลือกวิธียืนยันตัวตน:")
-    print("  1: .ROBLOSECURITY Cookie (ง่าย, ไม่ปลอดภัย)")
-    print("  2: OpenCloud x-api-key (แนะนำ, ปลอดภัยกว่า)")
+    print("Select Authentication Method:")
+    print("  1: .ROBLOSECURITY Cookie (Simple, less secure)")
+    print("  2: OpenCloud x-api-key (Recommended, more secure)")
     
     auth_choice = ""
     while auth_choice not in ('1', '2'):
-        auth_choice = input("เลือก (1 หรือ 2): ").strip()
+        auth_choice = input("Select (1 or 2): ").strip()
         
     if auth_choice == '1':
-        cfg["roblosecurity"] = input("วาง .ROBLOSECURITY Cookie ของคุณ: ").strip()
+        cfg["roblosecurity"] = input("Paste your .ROBLOSECURITY Cookie: ").strip()
     else:
-        cfg["x_api_key"] = input("วาง x-api-key ของคุณ: ").strip()
+        cfg["x_api_key"] = input("Paste your x-api-key: ").strip()
         
     if not cfg["roblosecurity"] and not cfg["x_api_key"]:
-        print("ไม่ได้ป้อนข้อมูลยืนยันตัวตน, ออกจากโปรแกรม")
+        print("No credentials provided, exiting.")
         sys.exit(1)
 
     try:
         port = find_free_port()
         server_address = ('localhost', port)
         
-        # ตั้งค่า Server
         with socketserver.TCPServer(server_address, PluginRequestHandler) as httpd:
             httpd.allow_reuse_address = True
             print("\n" + "="*40)
-            print(f"✅ Server พร้อมทำงานแล้ว!")
-            print(f"📡 Plugin ของคุณสามารถเชื่อมต่อได้ที่:")
+            print(f"✅ Server is running!")
+            print(f"📡 Your plugin can connect at:")
             print(f"      http://localhost:{port}")
-            print("\n👉 กรุณาคัดลอก Port Number ต่อไปนี้ไปใส่ใน Roblox Plugin:")
+            print("\n👉 Please copy this Port Number into your Roblox Plugin:")
             print(f"      {port}")
             print("="*40)
-            print("\n(Server นี้จะทำงานไปเรื่อยๆ, กด Ctrl+C เพื่อปิด)")
+            print("\n(Server is running. Press Ctrl+C to stop)")
             
-            # เริ่ม Server
             httpd.serve_forever()
             
     except KeyboardInterrupt:
-        print("\n[INFO] ปิด Server...")
+        print("\n[INFO] Stopping server...")
     except Exception as e:
-        print(f"[ERROR] ไม่สามารถเริ่ม Server: {e}")
-        print("อาจมีโปรแกรมอื่นใช้ Port นี้อยู่ หรือ Antivirus บล็อกไว้")
-        input("กด Enter เพื่อปิด...")
+        print(f"[ERROR] Failed to start server: {e}")
+        print("Another program might be using this port, or Antivirus is blocking it.")
+        input("Press Enter to exit...")
 
 if __name__ == "__main__":
     main()
