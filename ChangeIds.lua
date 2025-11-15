@@ -77,10 +77,9 @@ local function transferProperties(oldInstance: Instance, newInstance: Instance)
     local className = oldInstance.ClassName
     if className ~= newInstance.ClassName then error(`oldInstance({className}) class is not equal to newInstance({newInstance.ClassName})`) end
     
-    -- [[ FIX ]] ApiDump อาจจะยังไม่ถูกโหลดในครั้งแรก
     local success, apiDumpCached = pcall(ApiDump.isCached)
     if not success or not apiDumpCached then
-        pcall(ApiDump.get) -- พยายามโหลดถ้ายังไม่มี
+        pcall(ApiDump.get) 
         if not ApiDump.isCached() then
              warn("ApiDump could not be fetched. Property transfer may be incomplete.")
              return
