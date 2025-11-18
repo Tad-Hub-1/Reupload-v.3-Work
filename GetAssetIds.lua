@@ -1,14 +1,19 @@
 --!strict
+-- [[  VERSION 2  ]]
+-- อัปเกรด:
+-- 1. สแกนแบบ Recursive (ดำดิ่ง) ทุกซอกทุกมุมของเกม
+-- 2. เพิ่มการสแกน Attributes ของทุก Instance
+
 local NUMBER_ONLY_FILTER = "%d+"
 
 export type FilterOptions = {
     WhitelistedInstances: { string },
-    Instances: { Instance },
+    Instances: { Instance }, -- (ตอนนี้จะเป็น {game})
 }
 
+-- (ฟังก์ชันลูกๆ เหมือนเดิม)
 local function isValidId(id: number): boolean
 	if id == 0 or id % 1 ~= 0 then return false end
-
 	local idLength = math.floor(math.log10(math.abs(id))) + 1
 	return idLength >= 7 and idLength <= 15
 end
@@ -16,7 +21,6 @@ end
 local function getId(filteredInstance: Instance, possibleId: any): { [number]: { Instance } }
     local id = tonumber(possibleId)
     if not id or not isValidId(id) then return {} end
-
     return { [id] = { filteredInstance } }
 end
 
@@ -25,7 +29,6 @@ local function getStringIds(filteredInstance: Instance, str: string): { [number]
 	for matchedString in string.gmatch(str, "%d+") do
 		local id = tonumber(matchedString)
 		if not id or idMap[id] or not isValidId(id) then continue end
-
 		idMap[id] = { filteredInstance }
 	end
     return idMap
@@ -66,11 +69,9 @@ end
 local instanceIdGetters: { [string]: (instance: any) -> { [number]: { Instance } } } = {
     Animation = getAnimationId,
     Sound = getSoundId,
-
     NumberValue = getNumberValueId,
     IntValue = getNumberValueId,
     StringValue = getStringValueIds,
-
     CharacterMesh = getCharacterMesh,
     MeshPart = getMeshPart,
     SpecialMesh = getSpecialMesh,
@@ -98,7 +99,6 @@ local function merge(originalIdMap: { [number]: { Instance } }, otherIdMap: { [n
             originalIdMap[id] = instanceArray
             continue
         end
-
         for _, instance in instanceArray do
             if table.find(idInstances, instance) then continue end
             table.insert(idInstances :: { any }, instance)
@@ -106,15 +106,44 @@ local function merge(originalIdMap: { [number]: { Instance } }, otherIdMap: { [n
     end
 end
 
+-- ==========================================================
+--  [[  ฟังก์ชันหลัก (แก้ไขใหม่ทั้งหมด)  ]]
+-- ==========================================================
 return function(filterOptions: FilterOptions): { [number]: { Instance } }
     local idMap = {}
     local filterMap = createFilterMap(filterOptions.WhitelistedInstances)
-    for _, instance in filterOptions.Instances do
+
+    -- สร้างฟังก์ชันสแกนแบบ "ดำดิ่ง" (Recursive)
+    local function scanInstance(instance: Instance)
+        -- 1. (เหมือนเดิม) ตรวจสอบ ClassName ของ Instance นี้
         local className = instance.ClassName
         local parseId = filterMap[className]
-        if not parseId then continue end
+        if parseId then
+            merge(idMap, parseId(instance))
+        end
 
-        merge(idMap, parseId(instance))
+        -- 2. (ใหม่!) ตรวจสอบ Attributes ทั้งหมดของ Instance นี้
+        for name, value in instance:GetAttributes() do
+            if typeof(value) == "string" then
+                -- ถ้า Attribute เป็น string, ให้ค้นหา ID ที่ซ่อนอยู่ในนั้น
+                merge(idMap, getStringIds(instance, value))
+            elseif typeof(value) == "number" then
+                -- ถ้า Attribute เป็น number, ให้ตรวจสอบว่ามันคือ ID หรือไม่
+                merge(idMap, getId(instance, value))
+            end
+        end
+
+        -- 3. (ใหม่!) สั่งให้สแกน "ลูก" ของ Instance นี้ต่อไป
+        for _, child in instance:GetChildren() do
+            -- (ใช้ pcall เพื่อความปลอดภัย เผื่อไปเจอที่ที่ไม่มีสิทธิ์)
+            pcall(scanInstance, child) 
+        end
     end
+
+    -- เริ่มต้นสแกนจากจุดที่กำหนด (ปกติคือ "game")
+    for _, rootInstance in filterOptions.Instances do
+        scanInstance(rootInstance)
+    end
+    
     return idMap
 end
