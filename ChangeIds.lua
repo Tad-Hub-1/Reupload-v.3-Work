@@ -1,5 +1,10 @@
 --!strict
--- [[ PATHS EDITED ]]
+-- [[  VERSION 2  ]]
+-- อัปเกรด:
+-- 1. เพิ่มฟังก์ชัน `setAttributeIds`
+-- 2. ใน Loop หลัก, สั่งให้ "ลองแทนที่" ทั้งใน Property และใน Attribute
+
+-- (Path เหล่านี้ถูกต้องแล้ว ถ้ามันอยู่ใน "หัวใจ" เดียวกัน)
 local ApiDump = require(script.Parent.ApiDump)
 local retry = require(script.Parent.Retry)
 local WaitGroup = require(script.Parent.WaitGroup)
@@ -14,6 +19,7 @@ export type IdPair = {
     oldId: number
 }
 
+-- (ฟังก์ชันลูกๆ ส่วนใหญ่เหมือนเดิม)
 local function setScriptIds(scriptInstance: LuaSourceContainer, idsToChange: { IdPair })
     local source = scriptInstance.Source
     if not source then
@@ -42,37 +48,39 @@ local function setSoundId(sound: Sound, oldId: number, newId: number)
     sound.SoundId = string.gsub(sound.SoundId, tostring(oldId), tostring(newId))  
 end
 
-local function setNumberValueId(numValue: NumberValue | IntValue, _: number, newId: number)
-    numValue.Value = newId
+local function setNumberValueId(numValue: NumberValue | IntValue, oldId: number, newId: number)
+    if numValue.Value == oldId then
+        numValue.Value = newId
+    end
 end
 
 local function setStringValueIds(strValue: StringValue, oldId: number, newId: number)
     strValue.Value = string.gsub(strValue.Value, tostring(oldId), tostring(newId)) 
 end
 
-local function setCharacterMesh(characterMesh: CharacterMesh, _: number, newId: number)
-    characterMesh.MeshId = newId
+local function setCharacterMesh(characterMesh: CharacterMesh, oldId: number, newId: number)
+    if characterMesh.MeshId == oldId then
+        characterMesh.MeshId = newId
+    end
 end
 
+-- (ฟังก์ชัน transfer... เหมือนเดิม)
 local function transferAttributes(oldInstance: Instance, newInstance: Instance)
     for name, value in oldInstance:GetAttributes() do
         newInstance:SetAttribute(name, value)
     end
 end
-
 local function transferTags(oldInstance: Instance, newInstance: Instance)
     for _, tag in oldInstance:GetTags() do
         newInstance:AddTag(tag)
     end
 end
-
 local function transferChildren(oldInstance: Instance, newInstance: Instance)
     for _, child in oldInstance:GetChildren() do
         if child:IsA("TouchTransmitter") then continue end
         child.Parent = newInstance
     end
 end
-
 local function transferProperties(oldInstance: Instance, newInstance: Instance)
     local className = oldInstance.ClassName
     if className ~= newInstance.ClassName then error(`oldInstance({className}) class is not equal to newInstance({newInstance.ClassName})`) end
@@ -99,7 +107,6 @@ local function transferProperties(oldInstance: Instance, newInstance: Instance)
         end)
     end
 end
-
 local function transferJoints(oldInstance: Instance, newInstance: Instance)
     for _, instance in game:GetDescendants() do
         if not instance:IsA("JointInstance") then continue end
@@ -112,6 +119,9 @@ local function transferJoints(oldInstance: Instance, newInstance: Instance)
 end
 
 local function setMeshPart(meshPart: MeshPart, oldId: number, newId: number)
+    -- (เราจะตรวจสอบ MeshId ที่นี่ เพื่อป้องกันการแทนที่มั่ว)
+    if not string.find(meshPart.MeshId, tostring(oldId)) then return end
+
     local contentRetrieved, content: Content = retry(3, Content.fromAssetId, newId) 
 	if not contentRetrieved then
 		warn(`failed to get content from {newId}, skipping {oldId}`)
@@ -147,16 +157,39 @@ end
 local instanceIdSetters = {
     Animation = setAnimationId,
     Sound = setSoundId,
-
     NumberValue = setNumberValueId,
     IntValue = setNumberValueId,
     StringValue = getStringValueIds,
-
     CharacterMesh = setCharacterMesh,
     MeshPart = setMeshPart,
     SpecialMesh = setSpecialMesh,
 }
 
+-- ==========================================================
+--  [[  ฟังก์ชันใหม่: แทนที่ใน Attributes  ]]
+-- ==========================================================
+local function setAttributeIds(instance: Instance, oldId: number, newId: number)
+    -- ฟังก์ชันนี้จะตรวจสอบ Attributes ทั้งหมด ของ Instance ที่ส่งเข้ามา
+    -- และแทนที่ ID ที่ตรงกัน
+    for name, value in instance:GetAttributes() do
+        if typeof(value) == "string" then
+            -- ถ้าเป็น string, เช็คว่ามี oldId อยู่ข้างในไหม
+            if string.find(value, tostring(oldId)) then
+                local newValue = string.gsub(value, tostring(oldId), tostring(newId))
+                instance:SetAttribute(name, newValue)
+            end
+        elseif typeof(value) == "number" then
+            -- ถ้าเป็น number, เช็คว่ามันคือ oldId เลยหรือไม่
+            if value == oldId then
+                instance:SetAttribute(name, newId)
+            end
+        end
+    end
+end
+
+-- ==========================================================
+--  [[  ฟังก์ชันหลัก (แก้ไขใหม่)  ]]
+-- ==========================================================
 return function(filteredIds: { [number]: { Instance } }, idsToChange: { IdPair })
     local waitGroup = WaitGroup.new()
     local scriptIdChanges = {}
@@ -169,26 +202,33 @@ return function(filteredIds: { [number]: { Instance } }, idsToChange: { IdPair }
         if not instanceArray then continue end
 
         for _, instance in instanceArray do
+            
+            -- 1. (เหมือนเดิม) ตรวจสอบ Script Source
             if instance:IsA("LuaSourceContainer") then
                 if not scriptIdChanges[instance] then scriptIdChanges[instance] = {} end
                 table.insert(scriptIdChanges[instance], idPair)
-                continue
+                -- (ไม่ continue, เพราะ Script ก็มี Attribute ได้)
             end
 
+            -- 2. (เหมือนเดิม) ตรวจสอบ Property มาตรฐาน
             local className = instance.ClassName
             local setInstanceId = instanceIdSetters[className]
-            if not setInstanceId then 
-                warn(`{className} is not a supported instance type for replacement, skipping.`)
-                continue 
+            if setInstanceId then
+                waitGroup:Add(function()
+                    pcall(setInstanceId :: any, instance, oldId, newId)
+                end)
             end
-
+            
+            -- 3. (ใหม่!) ตรวจสอบ Attributes ทั้งหมด
+            -- (เราจะเรียกอันนี้กับ *ทุก* Instance ที่เจอ
+            -- เพราะเราไม่รู้ว่า ID ที่เจอ มาจาก Property หรือ Attribute)
             waitGroup:Add(function()
-                local success, result = pcall(setInstanceId :: any, instance, oldId, newId)
-                if not success then warn("Failed to change", instance, `{oldId} to {newId}:`, result) end
+                pcall(setAttributeIds, instance, oldId, newId)
             end)
         end
     end
 
+    -- (ส่วนนี้เหมือนเดิม)
     for instance, idPairs in scriptIdChanges do
         waitGroup:Add(function()
             local success, result = pcall(setScriptIds, instance, idPairs)
@@ -198,3 +238,5 @@ return function(filteredIds: { [number]: { Instance } }, idsToChange: { IdPair }
 
     waitGroup:Wait()
 end
+
+
